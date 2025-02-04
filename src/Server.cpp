@@ -4,11 +4,11 @@
 #include <vector>
 #include <sstream>
 #include <unordered_map>
-#include <ctime>
+#include <chrono>
 
 using asio::ip::tcp;  // Simplify TCP namespace
-
-using StorageType = std::unordered_map<std::string, std::tuple<std::string, std::time_t>>;
+using TimePoint = std::chrono::steady_clock::time_point;
+using StorageType = std::unordered_map<std::string, std::tuple<std::string, std::chrono::steady_clock::time_point>>;
 
 // Session handles each client connection. Inherits from enable_shared_from_this
 // to allow safe shared_ptr management in async callbacks
@@ -61,10 +61,14 @@ private:
                         std::string key = split_data[4];
                         std::string value = split_data[6];
                         std::time_t expiry_time = 0;
-                        if (split_data.size() >= 11 and split_data[8] == "px") {
-                            expiry_time = std::time(nullptr) + (std::stoi(split_data[10]) / 1000);
+                        if (split_data.size() >= 11 && split_data[8] == "px") {
+                            int expiry_ms = std::stoi(split_data[10]); // milliseconds
+                            auto expiry_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(expiry_ms);
+                            (*storage_)[key] = std::make_tuple(value, expiry_time);
+                        } else {
+                            // Use a distant future time if no expiry is specified
+                            (*storage_)[key] = std::make_tuple(value, TimePoint::max());
                         }
-                        (*storage_)[key] = std::make_tuple(value, expiry_time);
                         message = "OK";
                     } 
                     else if (split_data[2] == "GET")
@@ -77,9 +81,9 @@ private:
                             message = "-1";
                         } else {
                             std::string stored_value = std::get<0>(it -> second);
-                            std::time_t expiry_time = std::get<1>(it -> second);
+                            TimePoint expiry_time = std::get<1>(it->second);
 
-                            if (expiry_time != 0 && std::time(nullptr) > expiry_time) {
+                            if (std::chrono::steady_clock::now() > expiry_time) {
                                 storage_->erase(it);
                                 message = "-1";
                             } else {
@@ -88,7 +92,7 @@ private:
                         }       
                     }
                     else {
-                        message = +"PONG";
+                        message = "PONG";
                     }
 
                     write(message, message.size());  // Respond to client
