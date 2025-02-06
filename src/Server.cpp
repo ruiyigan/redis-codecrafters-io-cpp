@@ -15,7 +15,12 @@ using StorageType = std::unordered_map<std::string, std::tuple<std::string, std:
 class Session : public std::enable_shared_from_this<Session> {
 public:
     // Constructor takes ownership of the socket
-    Session(tcp::socket socket, std::shared_ptr<StorageType> storage) : socket_(std::move(socket)), storage_(storage) {}
+    Session(
+        tcp::socket socket, 
+        std::shared_ptr<StorageType> storage,
+        std::string dir,
+        std::string dbfilename
+    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename) {}
     // Start the session's async operations
     void start() {
         read();  // Initiate first read
@@ -51,10 +56,11 @@ private:
                     std::cout << "Received: \n" << data << std::endl;
                     std::vector<std::string> split_data = splitString(data, '\n');
 
-                    std::string message;
+                    std::vector<std::string> messages;
+
                     if (split_data[2] == "ECHO") {
                         // repeat
-                        message = split_data.back();
+                        messages.push_back(split_data.back());
                     }
                     else if (split_data[2] == "SET") {
                         // save
@@ -69,7 +75,7 @@ private:
                             // Use a distant future time if no expiry is specified
                             (*storage_)[key] = std::make_tuple(value, TimePoint::max());
                         }
-                        message = "OK";
+                        messages.push_back("OK");
                     } 
                     else if (split_data[2] == "GET")
                     {
@@ -78,24 +84,30 @@ private:
 
                         auto it = storage_->find(key);
                         if (it == storage_->end()) {
-                            message = "-1";
                         } else {
                             std::string stored_value = std::get<0>(it -> second);
                             TimePoint expiry_time = std::get<1>(it->second);
 
                             if (std::chrono::steady_clock::now() > expiry_time) {
                                 storage_->erase(it);
-                                message = "-1";
                             } else {
-                                message = stored_value;
+                                messages.push_back(stored_value);
                             }
                         }       
                     }
+                    else if (split_data[2] == "CONFIG") {
+                        if (split_data[4] == "GET") {
+                            std::string param_name = split_data[6];
+                            std::string param_value = dir_;
+                            messages.push_back(param_name);
+                            messages.push_back(param_value);
+                        }
+                    }
                     else {
-                        message = "PONG";
+                        messages.push_back("PONG");
                     }
 
-                    write(message, message.size());  // Respond to client
+                    write(messages);  // Respond to client
                 } else {
                     // Handle errors (including client disconnects)
                     if (ec != asio::error::eof) {
@@ -105,13 +117,20 @@ private:
             });
     }
 
-    void write(std::string data, int length) {
+    void write(std::vector<std::string> messages) {
         auto self(shared_from_this());
         std::stringstream msg_stream;
-        if (data == "-1") {
+
+        if (messages.size() == 0) {
             msg_stream << "$-1\r\n";
         } else {
-            msg_stream << "$" << length << "\r\n" << data << "\r\n";
+            int num_messages = messages.size();
+            if (messages.size() > 1) {
+                msg_stream << "*" << num_messages << "\r\n";
+            }
+            for (std::string message: messages) {
+                msg_stream << "$" << message.size() << "\r\n" << message << "\r\n";
+            }
         }
         std::string msg = msg_stream.str();
         
@@ -128,31 +147,52 @@ private:
 
     tcp::socket socket_;          // Client connection socket
     std::array<char, 1024> buffer_;  // Data buffer (fixed-size array)
-    std::shared_ptr<StorageType> storage_;
+    std::shared_ptr<StorageType> storage_; // shared acrosss sessions
+    std::string dir_;
+    std::string dbfilename_;
 };
 
-void accept_connections(tcp::acceptor& acceptor, std::shared_ptr<StorageType> storage) {
+void accept_connections(
+        tcp::acceptor& acceptor, 
+        std::shared_ptr<StorageType> storage,
+        std::string dir,
+        std::string dbfilename
+    ) {
     acceptor.async_accept(
-        [&acceptor, storage](asio::error_code ec, tcp::socket socket) {
+        [&acceptor, storage, dir, dbfilename](asio::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<Session>(std::move(socket), storage)->start();
+                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename)->start();
                 std::cout << "Client connected" << std::endl;
             }
-            accept_connections(acceptor, storage);
+            accept_connections(acceptor, storage, dir, dbfilename); // recursion
         });
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
         asio::io_context io_context;
+        std::string dir;
+        std::string dbfilename;
+
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+
+            if (arg == "--dir") {
+                dir = argv[i + 1];
+            }
+
+            if (arg == "--dbfilename") {
+                dbfilename = argv[i + 1];
+            }
+        }
         
         // Create acceptor listening on port 6379 (IPv4)
         tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 6379));
         
-        auto storage = std::make_shared<StorageType>();  // HEREHEREHERE - Use tuple storage
+        auto storage = std::make_shared<StorageType>();  // Use tuple storage
 
         // Start accepting connections
-        accept_connections(acceptor, storage);
+        accept_connections(acceptor, storage, dir, dbfilename);
         std::cout << "Server listening on port 6379..." << std::endl;
         
         // Run the I/O service - blocks until all work is done
