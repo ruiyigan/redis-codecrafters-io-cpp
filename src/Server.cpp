@@ -5,6 +5,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <chrono>
+#include <fstream>  // Include fstream for file operations
 
 using asio::ip::tcp;  // Simplify TCP namespace
 using TimePoint = std::chrono::steady_clock::time_point;
@@ -42,6 +43,104 @@ private:
         return tokens;
     }
 
+    // helper to read size
+    uint64_t readDecodedSize(std::ifstream &file) {
+        char first_byte;
+        file.get(first_byte);
+        unsigned char unsigned_first_byte = static_cast<unsigned char>(first_byte);
+        int type = (first_byte & 0xC0) >> 6;
+        uint64_t length = 0;
+
+        if (type == 0) {
+            length = unsigned_first_byte & 0x3F; // 00111111
+        } else if (type == 1) {
+            char second_byte;
+            file.get(second_byte);
+            length = unsigned_first_byte & 0x3F + static_cast<unsigned char>(second_byte);
+        } else if (type == 2) {
+            unsigned char buf[4];
+            file.read(reinterpret_cast<char*>(buf), 4);
+            length = (uint64_t)buf[0]
+               | ((uint64_t)buf[1] << 24)
+               | ((uint64_t)buf[2] << 16)
+               | ((uint64_t)buf[3] << 8);
+        } else {
+            length = 0; // string encoding
+        }
+        return length;
+    }
+    // helper to read string
+
+    void readFile(const std::string& dir, const std::string& filename, std::shared_ptr<StorageType> storage_) {
+        std::string filepath = dir + "/" + filename;
+
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            throw std::runtime_error("Could not open file: " + filepath);
+        }
+
+        std::string result;
+        char ch;
+        std::string current_string;
+        uint64_t size;
+        uint64_t size_with_expiry;
+        bool is_database = false;
+        while (file.get(ch)) {
+            // each ch is 1 byte in size
+            // so can use this to detect headers and then segment them
+            if (static_cast<unsigned char>(ch) == 0xFB) {
+                size = readDecodedSize(file);
+                size_with_expiry = readDecodedSize(file);
+                is_database = true;
+            }
+
+            if (is_database) { // means reached database section
+                std::chrono::steady_clock::time_point expiry_time = TimePoint::max();
+                if ((static_cast<unsigned char>(ch) == 0xFC)) {
+                    // expiry in 8-byte unsigned long, in little-endian (read right-to-left) milliseconds.
+                    unsigned char buff_expiry[8];
+                    file.read(reinterpret_cast<char*>(buff_expiry), 8);
+                    auto expiry_ms = (uint64_t)buff_expiry[0]
+                    | ((uint64_t)buff_expiry[1] << 8)
+                    | ((uint64_t)buff_expiry[2] << 16)
+                    | ((uint64_t)buff_expiry[3] << 24)
+                    | ((uint64_t)buff_expiry[4] << 32)
+                    | ((uint64_t)buff_expiry[5] << 40)
+                    | ((uint64_t)buff_expiry[6] << 48)
+                    | ((uint64_t)buff_expiry[7] << 56);
+
+                    expiry_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(expiry_ms);
+                } else if ((static_cast<unsigned char>(ch) == 0xFD)) {
+                    // expiry in 4-byte unsigned integer, in little-endian (read right-to-left) seconds.
+                    unsigned char buff_expiry[4];
+                    file.read(reinterpret_cast<char*>(buff_expiry), 4);
+                    auto expiry_s = (uint64_t)buff_expiry[0]
+                    | ((uint64_t)buff_expiry[1] << 8)
+                    | ((uint64_t)buff_expiry[2] << 16)
+                    | ((uint64_t)buff_expiry[3] << 24);
+                    expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(expiry_s);
+                }
+
+                if (static_cast<unsigned char>(ch) == 0x00) {
+                    int size_key = readDecodedSize(file);
+                    unsigned char buff_key[size_key];
+                    file.read(reinterpret_cast<char*>(buff_key), size_key);
+                    std::string key(reinterpret_cast<const char*>(buff_key), size_key);
+                    int size_value = readDecodedSize(file);
+                    unsigned char buff_value[size_value];
+                    file.read(reinterpret_cast<char*>(buff_value), size_value);
+                    std::string value(reinterpret_cast<const char*>(buff_value), size_value);
+                    
+                    (*storage_)[key] = std::make_tuple(value, expiry_time);
+                } 
+            }
+            
+
+            result.push_back(ch);
+        }
+
+    }
+
     void read() {
         // Capture a shared_ptr to keep object alive during async operation
         auto self(shared_from_this());
@@ -58,6 +157,7 @@ private:
 
                     std::vector<std::string> messages;
 
+                    bool include_size = false;
                     if (split_data[2] == "ECHO") {
                         // repeat
                         messages.push_back(split_data.back());
@@ -103,11 +203,18 @@ private:
                             messages.push_back(param_value);
                         }
                     }
+                    else if (split_data[2] == "KEYS") {
+                        readFile(dir_, dbfilename_, storage_);
+                        for (const auto &entry : *storage_) {
+                            messages.push_back(entry.first);
+                        }
+                        include_size = true;
+                    }
                     else {
                         messages.push_back("PONG");
                     }
 
-                    write(messages);  // Respond to client
+                    write(messages, include_size);  // Respond to client
                 } else {
                     // Handle errors (including client disconnects)
                     if (ec != asio::error::eof) {
@@ -117,7 +224,7 @@ private:
             });
     }
 
-    void write(std::vector<std::string> messages) {
+    void write(std::vector<std::string> messages, bool size = false) {
         auto self(shared_from_this());
         std::stringstream msg_stream;
 
@@ -125,7 +232,7 @@ private:
             msg_stream << "$-1\r\n";
         } else {
             int num_messages = messages.size();
-            if (messages.size() > 1) {
+            if (messages.size() > 1 || size) {
                 msg_stream << "*" << num_messages << "\r\n";
             }
             for (std::string message: messages) {
