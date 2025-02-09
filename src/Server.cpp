@@ -6,8 +6,9 @@
 #include <unordered_map>
 #include <chrono>
 #include <fstream>  // Include fstream for file operations
+#include <filesystem>
 
-using asio::ip::tcp;  // Simplify TCP namespace
+using asio::ip::tcp;  
 using TimePoint = std::chrono::steady_clock::time_point;
 using StorageType = std::unordered_map<std::string, std::tuple<std::string, std::chrono::steady_clock::time_point>>;
 
@@ -74,6 +75,11 @@ private:
     void readFile(const std::string& dir, const std::string& filename, std::shared_ptr<StorageType> storage_) {
         std::string filepath = dir + "/" + filename;
 
+        if (!std::filesystem::exists(filepath)) {
+            std::cerr << "File does not exist: " << filepath << std::endl;
+            return;
+        }
+
         std::ifstream file(filepath);
         if (!file.is_open()) {
             throw std::runtime_error("Could not open file: " + filepath);
@@ -130,7 +136,8 @@ private:
                     unsigned char buff_value[size_value];
                     file.read(reinterpret_cast<char*>(buff_value), size_value);
                     std::string value(reinterpret_cast<const char*>(buff_value), size_value);
-                    
+                    std::cout << "KEY FROM RDB..: " << key << std::endl;
+                    std::cout << "VALUE FROM RDB..: " << value << std::endl;
                     (*storage_)[key] = std::make_tuple(value, expiry_time);
                 } 
             }
@@ -156,7 +163,7 @@ private:
                     std::vector<std::string> split_data = splitString(data, '\n');
 
                     std::vector<std::string> messages;
-
+                    readFile(dir_, dbfilename_, storage_);
                     bool include_size = false;
                     if (split_data[2] == "ECHO") {
                         // repeat
@@ -204,7 +211,6 @@ private:
                         }
                     }
                     else if (split_data[2] == "KEYS") {
-                        readFile(dir_, dbfilename_, storage_);
                         for (const auto &entry : *storage_) {
                             messages.push_back(entry.first);
                         }
@@ -241,6 +247,8 @@ private:
         }
         std::string msg = msg_stream.str();
         
+
+        std::cout << "MESSAGE..: " << msg << std::endl;
         // Async write operation
         asio::async_write(socket_, asio::buffer(msg, msg.size()),
             [this, self](asio::error_code ec, std::size_t /*length*/) {
