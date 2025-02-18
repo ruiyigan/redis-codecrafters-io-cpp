@@ -21,8 +21,9 @@ public:
         tcp::socket socket, 
         std::shared_ptr<StorageType> storage,
         std::string dir,
-        std::string dbfilename
-    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename) {}
+        std::string dbfilename,
+        std::string masterdetails
+    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails) {}
     // Start the session's async operations
     void start() {
         read();  // Initiate first read
@@ -229,6 +230,22 @@ private:
                         }
                         include_size = true;
                     }
+                    else if (split_data[2] == "INFO") {
+                        if (masterdetails_ == "") {
+                            // master
+                            std::string role = "role:master";
+                            std::string master_repl_offset = "nmaster_repl_offset:0";
+                            std::string nmaster_replid = "nmaster_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+                            std::string message = role + "\r\n" + master_repl_offset + "\r\n" + nmaster_replid;
+                            messages.push_back(message);
+                        } else {
+                            // not master
+                            messages.push_back("role:slave");
+                        }
+                    }
+                    else if (split_data[2] == "REPLCONF") {
+                        messages.push_back("OK");
+                    }
                     else {
                         messages.push_back("PONG");
                     }
@@ -261,7 +278,7 @@ private:
         std::string msg = msg_stream.str();
         
 
-        std::cout << "MESSAGE..: " << msg << std::endl;
+        std::cout << "MESSAGE SENT..: " << msg << std::endl;
         // Async write operation
         asio::async_write(socket_, asio::buffer(msg, msg.size()),
             [this, self](asio::error_code ec, std::size_t /*length*/) {
@@ -278,22 +295,130 @@ private:
     std::shared_ptr<StorageType> storage_; // shared acrosss sessions
     std::string dir_;
     std::string dbfilename_;
+    std::string masterdetails_;
 };
 
 void accept_connections(
         tcp::acceptor& acceptor, 
         std::shared_ptr<StorageType> storage,
         std::string dir,
-        std::string dbfilename
+        std::string dbfilename,
+        std::string masterdetails
     ) {
     acceptor.async_accept(
-        [&acceptor, storage, dir, dbfilename](asio::error_code ec, tcp::socket socket) {
+        [&acceptor, storage, dir, dbfilename, masterdetails](asio::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename)->start();
+                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename, masterdetails)->start();
                 std::cout << "Client connected" << std::endl;
             }
-            accept_connections(acceptor, storage, dir, dbfilename); // recursion
+            accept_connections(acceptor, storage, dir, dbfilename, masterdetails); // recursion
         });
+}
+
+std::pair<std::string, std::string> parseHostPort(const std::string& masterdetails) {
+    std::istringstream iss(masterdetails);
+    std::string host, port;
+    iss >> host >> port;
+    return {host, port};
+}
+
+// A generic helper to read until "\r\n" and then call a callback
+void readResponse(std::shared_ptr<tcp::socket> socket, const std::string& context, std::function<void()> callback) {
+    auto response_buffer = std::make_shared<std::string>();
+    asio::async_read_until(
+        *socket,
+        asio::dynamic_buffer(*response_buffer),
+        "\r\n",
+        [socket, response_buffer, context, callback](asio::error_code ec, std::size_t length) {
+            if (!ec) {
+                std::string response = response_buffer->substr(0, length);
+                std::cout << "Received from master " << context << ": " << response << std::endl;
+                callback();
+            } else {
+                std::cerr << "Error reading response " << context << ": " << ec.message() << std::endl;
+            }
+        }
+    );
+}
+
+
+void connectToMaster(asio::io_context& io_context, const std::string& masterdetails) {
+    auto [masterHost, masterPort] = parseHostPort(masterdetails);
+
+    auto master_socket = std::make_shared<tcp::socket>(io_context);
+    tcp::resolver resolver(io_context);
+    auto endpoints = resolver.resolve(masterHost, masterPort);
+
+    asio::async_connect(
+        *master_socket,
+        endpoints,
+        [master_socket](asio::error_code ec, tcp::endpoint /*ep*/) {
+            if (!ec) {
+                std::cout << "Connected to master. Now sending PING..." << std::endl;
+                // FIRST STEP SEND PING
+                std::string ping_cmd = "*1\r\n$4\r\nPING\r\n";
+                asio::async_write(
+                    *master_socket,
+                    asio::buffer(ping_cmd),
+                    [master_socket](asio::error_code ec, std::size_t /*length*/) {
+                        if (!ec) {
+                            std::cout << "PING command sent successfully to master!" << std::endl;
+                            readResponse(master_socket, "after PING", [master_socket](){
+                                // SECOND STEP SEND REPL
+                                std::string first_replconf = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n";
+                                asio::async_write(
+                                    *master_socket,
+                                    asio::buffer(first_replconf),
+                                    [master_socket](asio::error_code ec, std::size_t /*length*/) {
+                                        if (!ec) {
+                                            std::cout << "first_replconf command sent successfully to master!" << std::endl;
+                                            // Send the second REPLCONF command
+                                            std::string second_replconf = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+                                            asio::async_write(
+                                                *master_socket,
+                                                asio::buffer(second_replconf),
+                                                [master_socket](asio::error_code ec, std::size_t /*length*/) {
+                                                    if (!ec) {
+                                                        std::cout << "second_replconf command sent successfully to master!" << std::endl;
+                                                        readResponse(master_socket, "after REPLCONF", [master_socket](){
+                                                            // SECOND STEP SEND PSYNC
+                                                            std::string psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+                                                            asio::async_write(
+                                                                *master_socket,
+                                                                asio::buffer(psync),
+                                                                [master_socket](asio::error_code ec, std::size_t /*length*/) {
+                                                                    if (!ec) {
+                                                                        std::cout << "PSYNC command sent successfully to master!" << std::endl;
+                                                                        readResponse(master_socket, "after PSYNC", [](){
+                                                                            // Handle any further steps or close the connection if needed.
+                                                                        });
+                                                                    } else {
+                                                                        std::cerr << "Error sending PSYNC to master: " << ec.message() << std::endl;
+                                                                    }
+                                                                }
+                                                            );
+                                                        });
+                                                    } else {
+                                                        std::cerr << "Error sending second REPLCONF to master: " << ec.message() << std::endl;
+                                                    }
+                                                }
+                                            );
+                                        } else {
+                                            std::cerr << "Error sending first REPLCONF to master: " << ec.message() << std::endl;
+                                        }
+                                    }
+                                );
+                            });
+                        } else {
+                            std::cerr << "Error sending PING to master: " << ec.message() << std::endl;
+                        }
+                    }
+                );
+            } else {
+                std::cerr << "Error connecting to master: " << ec.message() << std::endl;
+            }
+        }
+    );
 }
 
 int main(int argc, char* argv[]) {
@@ -301,6 +426,8 @@ int main(int argc, char* argv[]) {
         asio::io_context io_context;
         std::string dir;
         std::string dbfilename;
+        int portnumber = 6379;
+        std::string masterdetails = "";
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -312,16 +439,28 @@ int main(int argc, char* argv[]) {
             if (arg == "--dbfilename") {
                 dbfilename = argv[i + 1];
             }
+
+            if (arg == "--port") {
+                portnumber = std::stoi(argv[i + 1]);
+            }
+
+            if (arg == "--replicaof") {
+                masterdetails = argv[i + 1];
+            }
         }
         
-        // Create acceptor listening on port 6379 (IPv4)
-        tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 6379));
+        // Create acceptor listening on port 6379 if not specified
+        tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), portnumber));
         
         auto storage = std::make_shared<StorageType>();  // Use tuple storage
 
         // Start accepting connections
-        accept_connections(acceptor, storage, dir, dbfilename);
-        std::cout << "Server listening on port 6379..." << std::endl;
+        accept_connections(acceptor, storage, dir, dbfilename, masterdetails);
+        std::cout << "Server listening on port " << portnumber << "..." << std::endl;
+
+        if (!masterdetails.empty()) {
+            connectToMaster(io_context, masterdetails);
+        }
         
         // Run the I/O service - blocks until all work is done
         io_context.run();
