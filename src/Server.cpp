@@ -1,35 +1,38 @@
 #include <iostream>
-#include <memory>       // For smart pointers and enable_shared_from_this
+#include <memory>       
 #include <asio.hpp>
 #include <vector>
 #include <sstream>
 #include <unordered_map>
 #include <chrono>
-#include <fstream>  // Include fstream for file operations
+#include <fstream>  
 #include <filesystem>
 
+// Use of type aliasing
 using asio::ip::tcp;  
 using TimePoint = std::chrono::system_clock::time_point;
 using StorageType = std::unordered_map<std::string, std::tuple<std::string, TimePoint>>;
 
-// Session handles each client connection. Inherits from enable_shared_from_this
-// to allow safe shared_ptr management in async callbacks
+// Session class handles each client connection. Inherits from enable_shared_from_this to allow safe shared_ptr management in async callbacks
+// When shared_from_this() called, a new shared_ptr created. Pointer exists as long as at least one async callback holding it
+// When the last shared_ptr destroyed, the Session object will be deleted.
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    // Constructor takes ownership of the socket
     Session(
         tcp::socket socket, 
         std::shared_ptr<StorageType> storage,
         std::string dir,
         std::string dbfilename,
-        std::string masterdetails
-    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails) {}
-    // Start the session's async operations
+        std::string masterdetails,
+        std::string master_repl_id,
+        unsigned master_repl_offset
+    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails), master_repl_id_(master_repl_id), master_repl_offset_(master_repl_offset) {}
     void start() {
         read();  // Initiate first read
     }
 
 private:
+    // Helper function to split string based on delimiter provided
     std::vector<std::string> splitString(const std::string& input, char delimiter) {
         std::vector<std::string> tokens;
         std::stringstream stream(input);
@@ -45,7 +48,7 @@ private:
         return tokens;
     }
 
-    // helper to read size
+    // Helper to read size based on RDB format
     uint64_t readDecodedSize(std::ifstream &file) {
         char first_byte;
         file.get(first_byte);
@@ -67,11 +70,12 @@ private:
                | ((uint64_t)buf[2] << 16)
                | ((uint64_t)buf[3] << 8);
         } else {
-            length = 0; // string encoding
+            length = 0; // string encoding, ignored for now
         }
         return length;
     }
     
+    // Helper to read expiry based on RDB format
     TimePoint readExpiry(std::ifstream &file, unsigned char umarker) {
         TimePoint expiry = TimePoint::max();
         if (umarker == 0xFC) {
@@ -104,6 +108,7 @@ private:
         return expiry;
     }
 
+    // Helper to read string based on RDB format
     std::string readString(std::ifstream &file) {
         int size = readDecodedSize(file);
         std::vector<char> buffer(size);
@@ -137,7 +142,7 @@ private:
                 continue;
             }
 
-            if (is_database) { // means reached database section
+            if (is_database) { // Reached database section
                 TimePoint expiry_time = TimePoint::max();
                 if ((static_cast<unsigned char>(ch) == 0xFC)) {
                     expiry_time = readExpiry(file, 0xFC);
@@ -161,15 +166,13 @@ private:
     }
 
     void read() {
-        // Capture a shared_ptr to keep object alive during async operation
+        // Capture a shared_ptr to keep object alive during async operation, all shared pointer shares the same reference count
         auto self(shared_from_this());
         
-        // Async read with buffer and completion handler
         socket_.async_read_some(asio::buffer(buffer_),
             // Lambda captures 'this' and self (shared_ptr) for proper lifetime
             [this, self](asio::error_code ec, std::size_t length) {
                 if (!ec) {
-                    // Successfully read data
                     std::string data = std::string(buffer_.data(), length);
                     std::cout << "Received: \n" << data << std::endl;
                     std::vector<std::string> split_data = splitString(data, '\n');
@@ -178,11 +181,11 @@ private:
                     readFile(dir_, dbfilename_, storage_);
                     bool include_size = false;
                     if (split_data[2] == "ECHO") {
-                        // repeat
+                        // Echos back message
                         messages.push_back(split_data.back());
                     }
                     else if (split_data[2] == "SET") {
-                        // save
+                        // Saves data from user
                         std::string key = split_data[4];
                         std::string value = split_data[6];
                         std::time_t expiry_time = 0;
@@ -198,7 +201,7 @@ private:
                     } 
                     else if (split_data[2] == "GET")
                     {
-                        // get
+                        // Get data from storage
                         std::string key = split_data[4];
 
                         auto it = storage_->find(key);
@@ -216,7 +219,9 @@ private:
                             }
                         }       
                     }
-                    else if (split_data[2] == "CONFIG") {
+                    else if (split_data[2] == "CONFIG") 
+                    {
+                        // Get config details
                         if (split_data[4] == "GET") {
                             std::string param_name = split_data[6];
                             std::string param_value = dir_;
@@ -225,6 +230,7 @@ private:
                         }
                     }
                     else if (split_data[2] == "KEYS") {
+                        // Get keys of redis
                         for (const auto &entry : *storage_) {
                             messages.push_back(entry.first);
                         }
@@ -232,25 +238,32 @@ private:
                     }
                     else if (split_data[2] == "INFO") {
                         if (masterdetails_ == "") {
-                            // master
+                            // Master
                             std::string role = "role:master";
                             std::string master_repl_offset = "nmaster_repl_offset:0";
-                            std::string nmaster_replid = "nmaster_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+                            std::string nmaster_replid = "nmaster_replid:";
+                            nmaster_replid += master_repl_id_;
                             std::string message = role + "\r\n" + master_repl_offset + "\r\n" + nmaster_replid;
                             messages.push_back(message);
                         } else {
-                            // not master
+                            // Not Master
                             messages.push_back("role:slave");
                         }
                     }
                     else if (split_data[2] == "REPLCONF") {
+                        // Second Part of handshake with replicas
                         messages.push_back("OK");
+                    }
+                    else if (split_data[2] == "PSYNC") {
+                        // Third Part of handshake with replicas
+                        std::string message = "+FULLRESYNC " + master_repl_id_ + " " + std::to_string(master_repl_offset_);
+                        messages.push_back(message);
                     }
                     else {
                         messages.push_back("PONG");
                     }
 
-                    write(messages, include_size);  // Respond to client
+                    write(messages, include_size);  
                 } else {
                     // Handle errors (including client disconnects)
                     if (ec != asio::error::eof) {
@@ -261,6 +274,7 @@ private:
     }
 
     void write(std::vector<std::string> messages, bool size = false) {
+        // Similar to read function, creates a shared pointer
         auto self(shared_from_this());
         std::stringstream msg_stream;
 
@@ -279,7 +293,6 @@ private:
         
 
         std::cout << "MESSAGE SENT..: " << msg << std::endl;
-        // Async write operation
         asio::async_write(socket_, asio::buffer(msg, msg.size()),
             [this, self](asio::error_code ec, std::size_t /*length*/) {
                 if (!ec) {
@@ -290,12 +303,15 @@ private:
             });
     }
 
-    tcp::socket socket_;          // Client connection socket
-    std::array<char, 1024> buffer_;  // Data buffer (fixed-size array)
-    std::shared_ptr<StorageType> storage_; // shared acrosss sessions
+    // Attributes of Session class
+    tcp::socket socket_;          
+    std::array<char, 1024> buffer_;  
+    std::shared_ptr<StorageType> storage_;
     std::string dir_;
     std::string dbfilename_;
     std::string masterdetails_;
+    std::string master_repl_id_;
+    unsigned master_repl_offset_;
 };
 
 void accept_connections(
@@ -303,18 +319,21 @@ void accept_connections(
         std::shared_ptr<StorageType> storage,
         std::string dir,
         std::string dbfilename,
-        std::string masterdetails
+        std::string masterdetails,
+        std::string master_repl_id,
+        unsigned master_repl_offset
     ) {
     acceptor.async_accept(
-        [&acceptor, storage, dir, dbfilename, masterdetails](asio::error_code ec, tcp::socket socket) {
+        [&acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename, masterdetails)->start();
+                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset)->start();
                 std::cout << "Client connected" << std::endl;
             }
-            accept_connections(acceptor, storage, dir, dbfilename, masterdetails); // recursion
+            accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset); // Recursively continues to listen for new connections 
         });
 }
 
+// Helper function to parse master details
 std::pair<std::string, std::string> parseHostPort(const std::string& masterdetails) {
     std::istringstream iss(masterdetails);
     std::string host, port;
@@ -322,7 +341,7 @@ std::pair<std::string, std::string> parseHostPort(const std::string& masterdetai
     return {host, port};
 }
 
-// A generic helper to read until "\r\n" and then call a callback
+// Helper to read until "\r\n" and then call a callback
 void readResponse(std::shared_ptr<tcp::socket> socket, const std::string& context, std::function<void()> callback) {
     auto response_buffer = std::make_shared<std::string>();
     asio::async_read_until(
@@ -341,7 +360,7 @@ void readResponse(std::shared_ptr<tcp::socket> socket, const std::string& contex
     );
 }
 
-
+// Helper to perform handshake and establish connection with master by a replica
 void connectToMaster(asio::io_context& io_context, const std::string& masterdetails) {
     auto [masterHost, masterPort] = parseHostPort(masterdetails);
 
@@ -426,8 +445,10 @@ int main(int argc, char* argv[]) {
         asio::io_context io_context;
         std::string dir;
         std::string dbfilename;
-        int portnumber = 6379;
+        unsigned portnumber = 6379;
         std::string masterdetails = "";
+        std::string master_repl_id = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+        unsigned master_repl_offset = 0;
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -455,7 +476,7 @@ int main(int argc, char* argv[]) {
         auto storage = std::make_shared<StorageType>();  // Use tuple storage
 
         // Start accepting connections
-        accept_connections(acceptor, storage, dir, dbfilename, masterdetails);
+        accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset);
         std::cout << "Server listening on port " << portnumber << "..." << std::endl;
 
         if (!masterdetails.empty()) {
