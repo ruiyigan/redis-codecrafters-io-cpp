@@ -16,10 +16,6 @@ using StorageType = std::unordered_map<std::string, std::tuple<std::string, Time
 // Session class handles each client connection. Inherits from enable_shared_from_this to allow safe shared_ptr management in async callbacks
 // When shared_from_this() called, a new shared_ptr created. Pointer exists as long as at least one async callback holding it
 // When the last shared_ptr destroyed, the Session object will be deleted.
-
-class Session;  // Forward declaration
-std::vector<std::shared_ptr<Session>> g_replica_sessions;
-
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(
@@ -38,7 +34,7 @@ public:
         is_replica_ = replica;
     }
 
-    // static std::shared_ptr<Session> g_replica_session;
+    inline static std::vector<std::shared_ptr<Session>> g_replica_sessions;
 
 private:
     // Helper function to split string based on delimiter provided
@@ -57,25 +53,39 @@ private:
         return tokens;
     }
 
-    std::vector<std::string> splitRedisCommands(const std::string &input) {
+    // Splits multiple array commands up
+    std::vector<std::string> splitMultipleArrayCommands(const std::string &input) {
         std::vector<std::string> tokens;
-        std::stringstream stream(input);
-        std::string token;
-    
-        // Split based on '*' character
-        while (std::getline(stream, token, '*')) {
-            if (!token.empty()) {
-                if (token.back() == '\r')
-                    token.pop_back();
-                // Check if token begins with a digit (this is a naive check to ensure it's a command)
-                if (!token.empty() && std::isdigit(token[0])) {
-                    tokens.push_back("*" + token);
-                }
+        size_t pos = 0;
+        while (true) {
+            // Find an '*' that is immediately followed by a digit.
+            size_t start = input.find('*', pos);
+            if (start == std::string::npos)
+                break;
+            if (start + 1 >= input.size() || !std::isdigit(input[start + 1])) {
+                // If '*' is not followed by a digit, skip it.
+                pos = start + 1;
+                continue;
             }
+            // Look for the next '*' that is immediately followed by a digit.
+            size_t nextPos = start + 1;
+            size_t nextDelimiter = std::string::npos;
+            while ((nextPos = input.find('*', nextPos)) != std::string::npos) {
+                if (nextPos + 1 < input.size() && std::isdigit(input[nextPos + 1])) {
+                    nextDelimiter = nextPos;
+                    break;
+                }
+                nextPos++;
+            }
+            // If no next delimiter is found, take the rest of the input.
+            size_t end = (nextDelimiter != std::string::npos) ? nextDelimiter : input.size();
+            tokens.push_back(input.substr(start, end - start));
+            pos = end;
         }
         return tokens;
     }
     
+    // Sends data to replica
     void propagate(const std::string &command) {
         auto self(shared_from_this());
         asio::async_write(socket_, asio::buffer(command),
@@ -88,14 +98,199 @@ private:
             });
     }
 
-    void processData(const std::string data) {
+    void processCommands(std::string data) {
+        size_t pos = data.find("\r\n");
+        if (pos == std::string::npos) {
+            std::cerr << "Invalid data: header not found." << std::endl;
+            return;
+        }
+
+        // In the event got multiple element of type array in the array
+        std::vector<std::string> split_commands = splitMultipleArrayCommands(data);
+        std::cout << "Number of split commands: " << split_commands.size() << std::endl;
+        for (auto split_command : split_commands) {
+            processCommand(split_command);
+        }
+    }
+
+    // Processes data and adds valid command into array
+    // Split data into each data type and their responding data: https://redis.io/docs/latest/develop/reference/protocol-spec/
+    void getValidDataTypeChunks(std::string data, std::vector<std::string>& validCommands) {
+        size_t pos = data.find("\r\n");
+        if (pos == std::string::npos) {
+            std::cerr << "Invalid data" << std::endl;
+            return;
+        }
+        // Data is at least ...\r\n
+        char token = data[0];
+        if (token == '+') {
+            size_t fullCommandLength = pos + 2;
+            std::string fullCommand = data.substr(0, fullCommandLength);
+            validCommands.push_back(fullCommand);
+            if (data.size() > fullCommandLength) {
+                // Excess data, at least another command within
+                std::string remainingData = data.substr(fullCommandLength);
+                getValidDataTypeChunks(remainingData, validCommands);
+            }
+        } else if (token == '$') {
+            // Find length of data first
+            size_t headerEnd = data.find("\r\n");
+            if (headerEnd == std::string::npos) {
+                std::cerr << "Incomplete bulk string header. Skipping remainder.\n";
+                return;
+            }
+            std::string lengthStr = data.substr(1, headerEnd - 1);
+            int bulkLength = std::stoi(lengthStr);
+            
+            // Calculate total length: header + CRLF + bulk data + CRLF (if not rdb)
+            size_t totalLength;
+            if (data.find("REDIS") != std::string::npos) {
+                totalLength = headerEnd + 2 + bulkLength; // rdb is like bulk string but without the trailing \r\n
+            } else {
+                totalLength = headerEnd + 2 + bulkLength + 2;
+            }
+
+            if (data.size() < totalLength) {
+                std::cout << "Insufficient data, need to get more data" << std::endl;
+                // TODO: Instead of throwing an exception, buffer the partial data and wait for additional bytes.
+            } else if (data.size() == totalLength) {
+                std::string fullCommand = data;
+                validCommands.push_back(fullCommand);
+            } else {
+                std::string fullCommand = data.substr(0, totalLength);
+                validCommands.push_back(fullCommand);
+                std::string remainingData = data.substr(totalLength);
+                // Excess data, at least another command within
+                getValidDataTypeChunks(remainingData, validCommands);
+            }
+        } else if (token == '*') { // For now * used only for commands
+            // TODO: Currently assuming no insufficient data or excess
+            std::vector<std::string> split_commands = splitMultipleArrayCommands(data);
+            for (auto split_command : split_commands) {
+                validCommands.push_back(split_command);
+            }
+        } else {
+            std::cout << "New token, not yet handled" << std::endl;
+        }
+    }
+
+    void processDataByType(std::string command) {
+        char token = command[0];
+        if (token == '+') {
+            std::cout << "Processing data type simple string" << std::endl;
+        } else if (token == '$') {
+            std::cout << "Processing data type bulk string" << std::endl;
+        } else if (token == '*') { // For now * used only for commands
+            processCommands(command);
+        } else {
+            throw std::runtime_error("Unknown token: " + token);
+        }
+    }
+
+    // Assume command receive is full command, no breaking
+    // Data received are either 1) Commands (these are array of bulk strings) 2) RESP type, starts with + * $ etc
+    // 1) send from master to replica or client to master 2) server replies or rdb file, not commands
+    void read() {
+        // https://redis.io/docs/latest/develop/reference/protocol-spec/#bulk-strings
+        auto self(shared_from_this());
+        auto response_buffer = std::make_shared<std::string>();
+        asio::async_read_until(
+            socket_,
+            asio::dynamic_buffer(*response_buffer),
+            "\r\n",
+            [this, self, response_buffer](asio::error_code ec, std::size_t length) {
+                if (!ec) {
+                    // Header and leftover not very useful now as data is sent as a whole without breaking
+                    // Hence, always has left over which is essentially the part after data
+                    std::string header = response_buffer->substr(0, length);
+                    std::string leftover = response_buffer->substr(length);     
+                    std::string data = header + leftover;
+                    std::vector<std::string> validCommands;
+
+                    getValidDataTypeChunks(data, validCommands);
+                    for (auto command : validCommands) {
+                        processDataByType(command);
+                    }
+                    read();
+                    
+                } else {
+                    if (ec != asio::error::eof) {
+                        std::cerr << "Read error: " << ec.message() << std::endl;
+                    }
+                }
+            }
+        );
+    }
+
+    // Validate data is valid command (ie: array of bulk strings) https://redis.io/docs/latest/develop/reference/protocol-spec/#resp-protocol-description
+    bool isDataValidRedisCommand(const std::string& data) {
+        // Check that data is not empty and starts with '*'
+        if (data.empty() || data[0] != '*')
+            return false;
+        
+        // Find end of array header (e.g., "*3\r\n")
+        size_t pos = data.find("\r\n");
+        if (pos == std::string::npos)
+            return false;
+        
+        // Parse the expected number of elements.
+        int expectedElements;
+        try {
+            expectedElements = std::stoi(data.substr(1, pos - 1));
+        } catch (const std::exception&) {
+            return false;
+        }
+        
+        // Initialize index after the header.
+        size_t index = pos + 2;
+        
+        for (int i = 0; i < expectedElements; i++) {
+            // Ensure the next character exists and is the bulk string marker '$'
+            if (index >= data.size() || data[index] != '$')
+                return false;
+            
+            // Find the end of the bulk string header (e.g., "$8\r\n")
+            size_t pos2 = data.find("\r\n", index);
+            if (pos2 == std::string::npos)
+                return false;
+            
+            // Parse the declared length for this bulk string.
+            int bulkLength;
+            try {
+                bulkLength = std::stoi(data.substr(index + 1, pos2 - index - 1));
+            } catch (const std::exception&) {
+                return false;
+            }
+            
+            // Calculate the starting index of the bulk data.
+            size_t startData = pos2 + 2;
+            
+            // Check if there are enough bytes for the bulk data plus the trailing "\r\n"
+            if (startData + bulkLength + 2 > data.size())
+                return false;
+            
+            index = startData + bulkLength + 2;
+        }
+        
+        // The command is complete only if we have parsed exactly all data.
+        return (index == data.size());
+    }    
+
+    // Processes commands. Commands are sent in an array consisting of only bulk strings
+    void processCommand(const std::string data) {
+        if (!isDataValidRedisCommand(data)) {
+            std::cout << "Command not of format array of bulk strings: " << data << std::endl;
+            return;
+        }
         std::vector<std::string> split_data = splitString(data, '\n');
         std::vector<std::string> messages;
         bool include_size = false;
         if (split_data[2] == "ECHO") {
             // Echos back message
             messages.push_back(split_data.back());
-            write(messages, include_size);  
+            if (!is_replica_) {
+                write(messages, include_size);  
+            }
         }
         else if (split_data[2] == "SET") {
             // Saves data from user
@@ -112,7 +307,6 @@ private:
             
             if (!is_replica_) { // propagate if not replica and respond
                 messages.push_back("OK");
-                std::cout << "PROPGATING Following Data: " << data << std::endl;
                 for (auto& replica_session : g_replica_sessions) {
                     if (replica_session) {
                         replica_session->propagate(data);
@@ -134,15 +328,15 @@ private:
                 std::string stored_value = std::get<0>(it -> second);
                 TimePoint expiry_time = std::get<1>(it -> second);
                 
-                std::cout << "TIME NOW at expiry FROM RDB..: " << expiry_time.time_since_epoch().count() << std::endl;
-                std::cout << "TIME NOW..: " << std::chrono::system_clock::now().time_since_epoch().count() << std::endl;
                 if (std::chrono::system_clock::now() > expiry_time) {
                     storage_->erase(it);
                 } else {
                     messages.push_back(stored_value);
                 }
             }   
-            write(messages, include_size);      
+            if (!is_replica_) {
+                write(messages, include_size);      
+            }
         }
         else if (split_data[2] == "CONFIG") 
         {
@@ -153,7 +347,9 @@ private:
                 messages.push_back(param_name);
                 messages.push_back(param_value);
             }
-            write(messages, include_size);  
+            if (!is_replica_) {
+                write(messages, include_size);  
+            }
         }
         else if (split_data[2] == "KEYS") {
             // Get keys of redis
@@ -161,7 +357,9 @@ private:
                 messages.push_back(entry.first);
             }
             include_size = true;
-            write(messages, include_size);  
+            if (!is_replica_) {
+                write(messages, include_size);  
+            }
         }
         else if (split_data[2] == "INFO") {
             if (masterdetails_ == "") {
@@ -176,59 +374,49 @@ private:
                 // Not Master
                 messages.push_back("role:slave");
             }
-            write(messages, include_size);  
+            if (!is_replica_) {
+                write(messages, include_size);  
+            }
         }
         else if (split_data[2] == "REPLCONF") {
-            // Second Part of handshake with replicas
-            messages.push_back("OK");
-            write(messages, include_size);  
+            if (is_replica_ && split_data[4] == "GETACK") {
+                std::cout << "Message sizes so far from master: " << messageSizes << std::endl;
+                std::string sizeStr = std::to_string(messageSizes);
+                manual_write("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$" + 
+                            std::to_string(sizeStr.length()) + "\r\n" + 
+                            sizeStr + "\r\n");
+            } else {
+                // Second Part of handshake with replicas
+                if (!is_replica_) {
+                    messages.push_back("OK");
+                    write(messages, include_size);  
+                }
+            }
         }
         else if (split_data[2] == "PSYNC") {
-            // Third Part of handshake with replicas
-            std::string message = "+FULLRESYNC " + master_repl_id_ + " " + std::to_string(master_repl_offset_);
-            messages.push_back(message);
-            write(messages, include_size);
-
-            g_replica_sessions.push_back(shared_from_this());
-
-            std::string empty_rdb = "\x52\x45\x44\x49\x53\x30\x30\x31\x31\xfa\x09\x72\x65\x64\x69\x73\x2d\x76\x65\x72\x05\x37\x2e\x32\x2e\x30\xfa\x0a\x72\x65\x64\x69\x73\x2d\x62\x69\x74\x73\xc0\x40\xfa\x05\x63\x74\x69\x6d\x65\xc2\x6d\x08\xbc\x65\xfa\x08\x75\x73\x65\x64\x2d\x6d\x65\x6d\xc2\xb0\xc4\x10\x00\xfa\x08\x61\x6f\x66\x2d\x62\x61\x73\x65\xc0\x00\xff\xf0\x6e\x3b\xfe\xc0\xff\x5a\xa2";
-            std::string return_msg = "$" + std::to_string(empty_rdb.length()) + "\r\n" + empty_rdb;
-            manual_write(return_msg);
+            if (!is_replica_) {
+                // Third Part of handshake with replicas
+                std::string message = "+FULLRESYNC " + master_repl_id_ + " " + std::to_string(master_repl_offset_);
+                messages.push_back(message);
+                write(messages, include_size);
+                g_replica_sessions.push_back(shared_from_this()); // new replica connected
+                std::string empty_rdb = "\x52\x45\x44\x49\x53\x30\x30\x31\x31\xfa\x09\x72\x65\x64\x69\x73\x2d\x76\x65\x72\x05\x37\x2e\x32\x2e\x30\xfa\x0a\x72\x65\x64\x69\x73\x2d\x62\x69\x74\x73\xc0\x40\xfa\x05\x63\x74\x69\x6d\x65\xc2\x6d\x08\xbc\x65\xfa\x08\x75\x73\x65\x64\x2d\x6d\x65\x6d\xc2\xb0\xc4\x10\x00\xfa\x08\x61\x6f\x66\x2d\x62\x61\x73\x65\xc0\x00\xff\xf0\x6e\x3b\xfe\xc0\xff\x5a\xa2";
+                std::string return_msg = "$" + std::to_string(empty_rdb.length()) + "\r\n" + empty_rdb;
+                manual_write(return_msg);
+            }
+        }
+        else if (split_data[2] == "WAIT") {
+            // Sending as RESP Integer Data Type https://redis.io/docs/latest/develop/reference/protocol-spec/#integers
+            manual_write(":" + std::to_string(g_replica_sessions.size()) + "\r\n");
         }
         else {
-            messages.push_back("PONG");
-            write(messages, include_size);  
+            if (!is_replica_) {
+                messages.push_back("PONG");
+                write(messages, include_size);  
+            }
         }
-    }
-
-    void read() {
-        // Capture a shared_ptr to keep object alive during async operation, all shared pointer shares the same reference count
-        auto self(shared_from_this());
-        
-        socket_.async_read_some(asio::buffer(buffer_),
-            // Lambda captures 'this' and self (shared_ptr) for proper lifetime
-            [this, self](asio::error_code ec, std::size_t length) {
-                if (!ec) {
-                    std::string data = std::string(buffer_.data(), length);
-                    std::cout << "Received: \n" << data << std::endl;
-                    std::cout << "Received first char: \n" << data[0] << std::endl;
-                    if (data[0] == '*') {
-                        // Split multiple commands into individual command
-                        std::vector<std::string> split_commands = splitRedisCommands(data);
-                        for (auto split_command : split_commands) {
-                            // std::cout << "COMMAND RECEIVED: \n" << split_command << std::endl;
-                            processData(split_command);
-                        }
-                    } else {
-                        processData(data);
-                    }
-                } else {
-                    // Handle errors (including client disconnects)
-                    if (ec != asio::error::eof) {
-                        std::cerr << "Read error: " << ec.message() << std::endl;
-                    }
-                }
-            });
+        // Adds commands received so far
+        messageSizes += data.size();
     }
 
     // Write without any parsing
@@ -244,6 +432,8 @@ private:
                 }
             });
     }
+
+    // Write with formatting, adding size of all messages and size of individual message
     void write(std::vector<std::string> messages, bool size = false) {
         // Similar to read function, creates a shared pointer
         auto self(shared_from_this());
@@ -282,6 +472,7 @@ private:
     std::string master_repl_id_;
     unsigned master_repl_offset_;
     bool is_replica_ = false;
+    size_t messageSizes = 0;
 };
 
 void accept_connections(
@@ -502,7 +693,6 @@ std::string readString(std::ifstream &file) {
     return std::string(buffer.data(), size);
 }
 
-
 void loadDatabase(const std::string &dir, const std::string &dbfilename, std::shared_ptr<StorageType> storage) {
     std::string filepath = dir + "/" + dbfilename;
     if (!std::filesystem::exists(filepath)) {
@@ -549,7 +739,6 @@ void loadDatabase(const std::string &dir, const std::string &dbfilename, std::sh
         }
     }
 }
-
 
 int main(int argc, char* argv[]) {
     try {
