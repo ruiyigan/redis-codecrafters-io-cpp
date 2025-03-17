@@ -11,7 +11,8 @@
 // Use of type aliasing
 using asio::ip::tcp;  
 using TimePoint = std::chrono::system_clock::time_point;
-using StorageType = std::unordered_map<std::string, std::tuple<std::string, TimePoint>>;
+using StringStorageType = std::unordered_map<std::string, std::tuple<std::string, TimePoint>>;
+using StreamStorageType = std::unordered_map<std::string, std::vector<std::tuple<std::string, std::vector<std::string>>>>;
 
 // Session class handles each client connection. Inherits from enable_shared_from_this to allow safe shared_ptr management in async callbacks
 // When shared_from_this() called, a new shared_ptr created. Pointer exists as long as at least one async callback holding it
@@ -20,13 +21,13 @@ class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(
         tcp::socket socket, 
-        std::shared_ptr<StorageType> storage,
+        std::shared_ptr<StringStorageType> storage,
         std::string dir,
         std::string dbfilename,
         std::string masterdetails,
         std::string master_repl_id,
         unsigned master_repl_offset
-    ) : socket_(std::move(socket)), storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails), master_repl_id_(master_repl_id), master_repl_offset_(master_repl_offset) {}
+    ) : socket_(std::move(socket)), string_storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails), master_repl_id_(master_repl_id), master_repl_offset_(master_repl_offset) {}
     void start() {
         read();  // Initiate first read
     }
@@ -107,7 +108,6 @@ private:
 
         // In the event got multiple element of type array in the array
         std::vector<std::string> split_commands = splitMultipleArrayCommands(data);
-        std::cout << "Number of split commands: " << split_commands.size() << std::endl;
         for (auto split_command : split_commands) {
             processCommand(split_command);
         }
@@ -205,6 +205,7 @@ private:
                     std::string header = response_buffer->substr(0, length);
                     std::string leftover = response_buffer->substr(length);     
                     std::string data = header + leftover;
+                    std::cout << "Data received: " << data << std::endl;
                     std::vector<std::string> validCommands;
 
                     getValidDataTypeChunks(data, validCommands);
@@ -276,6 +277,29 @@ private:
         return (index == data.size());
     }    
 
+    bool hasAcknowledged(size_t expectedOffset) {
+        return lastAcknowledgedBytes >= expectedOffset;
+    }
+
+    bool xaadIdIsGreaterThan(const std::string& newId, const std::string& oldId) {
+        size_t dashPos_newId = newId.find('-');
+        size_t dashPos_oldId = oldId.find('-');
+        int leftPart_newId = std::stoi(newId.substr(0, dashPos_newId));
+        std::string rightPart_newId = newId.substr(dashPos_newId + 1);
+        int leftPart_oldId = std::stoi(oldId.substr(0, dashPos_oldId)); // don't have * so can convert direct to int
+        int rightPart_oldId = std::stoi(oldId.substr(dashPos_oldId + 1));
+
+        if (leftPart_newId != leftPart_oldId) {
+            return leftPart_newId > leftPart_oldId;
+        }
+        // If left parts are equal, compare right parts
+        // If right part is a wild card then return true
+        if (rightPart_newId == "*") {
+            return true;
+        }
+        return std::stoi(rightPart_newId) > rightPart_oldId;
+    }
+
     // Processes commands. Commands are sent in an array consisting of only bulk strings
     void processCommand(const std::string data) {
         if (!isDataValidRedisCommand(data)) {
@@ -288,9 +312,7 @@ private:
         if (split_data[2] == "ECHO") {
             // Echos back message
             messages.push_back(split_data.back());
-            if (!is_replica_) {
-                write(messages, include_size);  
-            }
+            write(messages, include_size); 
         }
         else if (split_data[2] == "SET") {
             // Saves data from user
@@ -300,13 +322,14 @@ private:
             if (split_data.size() >= 11 && split_data[8] == "px") {
                 int expiry_ms = std::stoi(split_data[10]); // milliseconds
                 auto expiry_time = std::chrono::system_clock::now() + std::chrono::milliseconds(expiry_ms);
-                (*storage_)[key] = std::make_tuple(value, expiry_time);
+                (*string_storage_)[key] = std::make_tuple(value, expiry_time);
             } else {
-                (*storage_)[key] = std::make_tuple(value, TimePoint::max());
+                (*string_storage_)[key] = std::make_tuple(value, TimePoint::max());
             }
             
             if (!is_replica_) { // propagate if not replica and respond
                 messages.push_back("OK");
+                propagatedCommandSizes += data.size(); 
                 for (auto& replica_session : g_replica_sessions) {
                     if (replica_session) {
                         replica_session->propagate(data);
@@ -322,21 +345,19 @@ private:
             // Get data from storage
             std::string key = split_data[4];
 
-            auto it = storage_->find(key);
-            if (it == storage_->end()) {
+            auto it = string_storage_->find(key);
+            if (it == string_storage_->end()) {
             } else {
                 std::string stored_value = std::get<0>(it -> second);
                 TimePoint expiry_time = std::get<1>(it -> second);
                 
                 if (std::chrono::system_clock::now() > expiry_time) {
-                    storage_->erase(it);
+                    string_storage_->erase(it);
                 } else {
                     messages.push_back(stored_value);
                 }
             }   
-            if (!is_replica_) {
-                write(messages, include_size);      
-            }
+            write(messages, include_size);
         }
         else if (split_data[2] == "CONFIG") 
         {
@@ -347,19 +368,15 @@ private:
                 messages.push_back(param_name);
                 messages.push_back(param_value);
             }
-            if (!is_replica_) {
-                write(messages, include_size);  
-            }
+            write(messages, include_size); 
         }
         else if (split_data[2] == "KEYS") {
             // Get keys of redis
-            for (const auto &entry : *storage_) {
+            for (const auto &entry : *string_storage_) {
                 messages.push_back(entry.first);
             }
             include_size = true;
-            if (!is_replica_) {
-                write(messages, include_size);  
-            }
+            write(messages, include_size);
         }
         else if (split_data[2] == "INFO") {
             if (masterdetails_ == "") {
@@ -374,20 +391,21 @@ private:
                 // Not Master
                 messages.push_back("role:slave");
             }
-            if (!is_replica_) {
-                write(messages, include_size);  
-            }
+            write(messages, include_size);
         }
         else if (split_data[2] == "REPLCONF") {
             if (is_replica_ && split_data[4] == "GETACK") {
-                std::cout << "Message sizes so far from master: " << messageSizes << std::endl;
-                std::string sizeStr = std::to_string(messageSizes);
-                manual_write("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$" + 
-                            std::to_string(sizeStr.length()) + "\r\n" + 
-                            sizeStr + "\r\n");
-            } else {
-                // Second Part of handshake with replicas
-                if (!is_replica_) {
+                std::string sizeStr = std::to_string(commandFromMasterSizes);
+                std::string ackMsg = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$" + 
+                         std::to_string(sizeStr.length()) + "\r\n" + 
+                         sizeStr + "\r\n";
+                manual_write(ackMsg);
+            } else {    
+                if (!is_replica_ && split_data[4] == "ACK") {
+                    size_t acknowledgedBytes = std::stoull(split_data[6]);
+                    this->lastAcknowledgedBytes = acknowledgedBytes;
+                } else {
+                    // Second Part of handshake with replicas
                     messages.push_back("OK");
                     write(messages, include_size);  
                 }
@@ -406,8 +424,145 @@ private:
             }
         }
         else if (split_data[2] == "WAIT") {
-            // Sending as RESP Integer Data Type https://redis.io/docs/latest/develop/reference/protocol-spec/#integers
-            manual_write(":" + std::to_string(g_replica_sessions.size()) + "\r\n");
+            int numReplicas = std::stoi(split_data[4]);
+            int timeoutMs = std::stoi(split_data[6]);
+            if (numReplicas == 0 || timeoutMs == 0) {
+                manual_write(":0\r\n");
+                return;
+            }
+            // Create a timer for the timeout
+            auto timer = std::make_shared<asio::steady_timer>(socket_.get_executor());
+            timer->expires_after(std::chrono::milliseconds(timeoutMs));
+        
+            // Store a reference to self to keep the session alive
+            auto self = shared_from_this();
+            
+            size_t offset = propagatedCommandSizes;
+
+            if (propagatedCommandSizes > 0) { // Only send GETACK if there’s something to acknowledge
+                std::string commandToGetACK = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+                for (auto& replica_session : g_replica_sessions) {
+                    if (replica_session) {
+                        replica_session->propagate(commandToGetACK);
+                    }
+                }
+                propagatedCommandSizes += commandToGetACK.size();
+            }
+            // Define a recursive function to check acknowledgments
+            std::function<void(const asio::error_code&)> checkAcks;
+
+            checkAcks = [this, self, timer, numReplicas, &checkAcks, offset](const asio::error_code& ec) {
+                if (ec) {
+                    // Timer was canceled or error occurred
+                    manual_write(":0\r\n");
+                    return;
+                }
+                // Count acknowledged replicas
+                int replicasAcknowledged = 0;
+                for (auto& replica_session : g_replica_sessions) {
+                    if (replica_session && replica_session->hasAcknowledged(offset)) {
+                        replicasAcknowledged++;
+                    }
+                }
+                
+                // Check if we've reached the target or timed out
+                if (replicasAcknowledged >= numReplicas || 
+                    timer->expiry() <= std::chrono::steady_clock::now()) {
+                    // Complete the operation
+                    manual_write(":" + std::to_string(replicasAcknowledged) + "\r\n");
+                    return;
+                }
+                    
+                // Otherwise, schedule another check after a short delay
+                timer->expires_after(std::chrono::milliseconds(50));
+                timer->async_wait(checkAcks);
+            };
+            
+            // Start the acknowledgment checking process
+            timer->async_wait(checkAcks);            
+        }
+        else if (split_data[2] == "TYPE") {
+            // Get type of data from storage
+            std::string key = split_data[4]; // TODO: I think by right a key can only hold one type of data at a time
+
+            auto it_stream = stream_storage_->find(key);
+            if (it_stream != stream_storage_->end()) {
+                write_simple_string("stream");
+            } else {
+                auto it_string = string_storage_->find(key);
+                if (it_string == string_storage_->end()) {
+                    write_simple_string("none");
+                } else {
+                    std::string stored_value = std::get<0>(it_string -> second);
+                    TimePoint expiry_time = std::get<1>(it_string -> second);
+                    
+                    if (std::chrono::system_clock::now() > expiry_time) {
+                        string_storage_->erase(it_string);
+                        write_simple_string("none");
+                    } else {
+                        write_simple_string("string"); 
+                    }
+                }   
+            }
+        }
+        else if (split_data[2] == "XADD") {
+            // Store stream data
+            std::string key = split_data[4];
+            std::string id = split_data[6];
+            std::string leftPart_Id, rightPart_Id;
+            std::vector<std::string> subVector(split_data.begin() + 7, split_data.end());
+            if (id == "*") {
+                std::string generated_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+                leftPart_Id = generated_id;
+                rightPart_Id = "0";
+                id = leftPart_Id + "-" + rightPart_Id;
+            } else {
+                size_t dashPos_Id = id.find('-');
+                leftPart_Id = id.substr(0, dashPos_Id);
+                rightPart_Id = id.substr(dashPos_Id + 1);
+
+            }
+
+            auto it_stream = stream_storage_->find(key);
+            if (it_stream == stream_storage_->end()) {
+                // create new entry in dictionary
+                std::vector<std::tuple<std::string, std::vector<std::string>>> new_entry;
+                if (leftPart_Id == "0" && rightPart_Id == "*") {
+                    id = leftPart_Id + "-" + "1"; // since lowest is 0-1
+                } else if (rightPart_Id == "*") {
+                    id = leftPart_Id + "-" + "0"; // default sequence number is 0
+                }
+                new_entry.push_back(std::make_tuple(id, subVector));
+                (*stream_storage_)[key] = new_entry;
+                write_bulk_string(id);
+            } else {
+                // check if entry is valid
+                const auto& last_tuple = it_stream->second.back();
+                std::string id_last_entry = std::get<0>(last_tuple);
+                if (!xaadIdIsGreaterThan(id, "0-0")) {
+                    manual_write("-ERR The ID specified in XADD must be greater than 0-0\r\n");
+                } else if (!xaadIdIsGreaterThan(id, id_last_entry)) {
+                    manual_write("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+                } else {
+                    if (rightPart_Id == "*") {
+                        size_t dashPos_id_last_entry = id_last_entry.find('-');
+                        std::string leftPart_Id_last_entry = id_last_entry.substr(0, dashPos_id_last_entry);
+                        int rightPart_Id_last_entry = std::stoi(id_last_entry.substr(dashPos_id_last_entry + 1));
+                        rightPart_Id_last_entry += 1;
+
+                        if (std::stoi(leftPart_Id) > std::stoi(leftPart_Id_last_entry)) {
+                            // if right side bigger and even if right part is *, just go to the new sequence with x-0
+                            id = leftPart_Id + "-" + "0";
+                        } else {
+                            id = leftPart_Id_last_entry + "-" + std::to_string(rightPart_Id_last_entry);
+                        }
+                    }
+                    auto& vector_of_tuples = it_stream->second;
+                    vector_of_tuples.push_back(std::make_tuple(id, subVector));
+                    write_bulk_string(id);
+                }
+            }
         }
         else {
             if (!is_replica_) {
@@ -416,14 +571,43 @@ private:
             }
         }
         // Adds commands received so far
-        messageSizes += data.size();
+        commandFromMasterSizes += data.size();
     }
 
+    // TODO: Write in different format simple string, bulk string, array
     // Write without any parsing
     void manual_write(std::string message) {
         auto self(shared_from_this());
         std::cout << "MESSAGE SENT (manual)..: " << message << std::endl;
         asio::async_write(socket_, asio::buffer(message, message.size()),
+            [this, self](asio::error_code ec, std::size_t /*length*/) {
+                if (!ec) {
+                    read();  // Continue reading after successful write
+                } else {
+                    std::cerr << "Write error: " << ec.message() << std::endl;
+                }
+            });
+    }
+
+    void write_simple_string(std::string message) {
+        auto self(shared_from_this());
+        std::string formatted_message = "+" + message + "\r\n";
+        std::cout << "MESSAGE SENT (simple string)..: " << formatted_message << std::endl;
+        asio::async_write(socket_, asio::buffer(formatted_message, formatted_message.size()),
+            [this, self](asio::error_code ec, std::size_t /*length*/) {
+                if (!ec) {
+                    read();  // Continue reading after successful write
+                } else {
+                    std::cerr << "Write error: " << ec.message() << std::endl;
+                }
+            });
+    }
+
+    void write_bulk_string(std::string message) {
+        auto self(shared_from_this());
+        std::string formatted_message = "$" + std::to_string(message.size()) + "\r\n" + message + "\r\n";
+        std::cout << "MESSAGE SENT (bulk string)..: " << formatted_message << std::endl;
+        asio::async_write(socket_, asio::buffer(formatted_message, formatted_message.size()),
             [this, self](asio::error_code ec, std::size_t /*length*/) {
                 if (!ec) {
                     read();  // Continue reading after successful write
@@ -465,19 +649,22 @@ private:
     // Attributes of Session class
     tcp::socket socket_;          
     std::array<char, 1024> buffer_;  
-    std::shared_ptr<StorageType> storage_;
+    std::shared_ptr<StringStorageType> string_storage_;
+    std::shared_ptr<StreamStorageType> stream_storage_ = std::make_shared<StreamStorageType>();;
     std::string dir_;
     std::string dbfilename_;
     std::string masterdetails_;
     std::string master_repl_id_;
     unsigned master_repl_offset_;
     bool is_replica_ = false;
-    size_t messageSizes = 0;
+    size_t commandFromMasterSizes = 0;
+    size_t propagatedCommandSizes = 0;
+    size_t lastAcknowledgedBytes = 0;
 };
 
 void accept_connections(
         tcp::acceptor& acceptor, 
-        std::shared_ptr<StorageType> storage,
+        std::shared_ptr<StringStorageType> storage,
         std::string dir,
         std::string dbfilename,
         std::string masterdetails,
@@ -525,7 +712,7 @@ void readResponse(std::shared_ptr<tcp::socket> socket, const std::string& contex
 // Helper to perform handshake and establish connection with master by a replica
 void connectToMaster(asio::io_context& io_context, 
                      const std::string& masterdetails,
-                     std::shared_ptr<StorageType> storage,
+                     std::shared_ptr<StringStorageType> storage,
                      const std::string& dir,
                      const std::string& dbfilename,
                      const std::string& master_repl_id,
@@ -550,7 +737,6 @@ void connectToMaster(asio::io_context& io_context,
                     asio::buffer(ping_cmd),
                     [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber](asio::error_code ec, std::size_t /*length*/) {
                         if (!ec) {
-                            std::cout << "PING command sent successfully to master!" << std::endl;
                             readResponse(master_socket, "after PING", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber]() {
                                 // SECOND STEP SEND REPLCONF commands
                                 std::string port_str = std::to_string(portnumber);
@@ -564,14 +750,12 @@ void connectToMaster(asio::io_context& io_context,
                                     asio::buffer(first_replconf),
                                     [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
                                         if (!ec) {
-                                            std::cout << "first_replconf command sent successfully to master!" << std::endl;
                                             std::string second_replconf = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
                                             asio::async_write(
                                                 *master_socket,
                                                 asio::buffer(second_replconf),
                                                 [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
                                                     if (!ec) {
-                                                        std::cout << "second_replconf command sent successfully to master!" << std::endl;
                                                         readResponse(master_socket, "after REPLCONF", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset]() {
                                                             // THIRD STEP SEND PSYNC
                                                             std::string psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
@@ -580,7 +764,6 @@ void connectToMaster(asio::io_context& io_context,
                                                                 asio::buffer(psync),
                                                                 [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
                                                                     if (!ec) {
-                                                                        std::cout << "PSYNC command sent successfully to master!" << std::endl;
                                                                         readResponse(master_socket, "after PSYNC", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset]() {
                                                                             std::cout << "Replication handshake complete. Switching to replica session." << std::endl;
                                                                             // Now, wrap the master_socket in a Session with replica mode enabled.
@@ -693,7 +876,7 @@ std::string readString(std::ifstream &file) {
     return std::string(buffer.data(), size);
 }
 
-void loadDatabase(const std::string &dir, const std::string &dbfilename, std::shared_ptr<StorageType> storage) {
+void loadDatabase(const std::string &dir, const std::string &dbfilename, std::shared_ptr<StringStorageType> storage) {
     std::string filepath = dir + "/" + dbfilename;
     if (!std::filesystem::exists(filepath)) {
         std::cerr << "File does not exist: " << filepath << std::endl;
@@ -733,7 +916,6 @@ void loadDatabase(const std::string &dir, const std::string &dbfilename, std::sh
                     break;
                 }
                 std::string value = readString(file);
-                std::cout << "Loaded key: " << key << ", value: " << value << std::endl;
                 (*storage)[key] = std::make_tuple(value, expiry_time);
             }
         }
@@ -773,7 +955,7 @@ int main(int argc, char* argv[]) {
         // Create acceptor listening on port 6379 if not specified
         tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), portnumber));
         
-        auto storage = std::make_shared<StorageType>();  // Use tuple storage
+        auto storage = std::make_shared<StringStorageType>();  // Use tuple storage
         loadDatabase(dir, dbfilename, storage);
 
         // Start accepting connections
