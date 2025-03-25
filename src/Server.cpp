@@ -26,8 +26,9 @@ public:
         std::string dbfilename,
         std::string masterdetails,
         std::string master_repl_id,
-        unsigned master_repl_offset
-    ) : socket_(std::move(socket)), string_storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails), master_repl_id_(master_repl_id), master_repl_offset_(master_repl_offset) {}
+        unsigned master_repl_offset,
+        std::shared_ptr<StreamStorageType> stream_storage
+    ) : socket_(std::move(socket)), string_storage_(storage), dir_(dir), dbfilename_(dbfilename), masterdetails_(masterdetails), master_repl_id_(master_repl_id), master_repl_offset_(master_repl_offset), stream_storage_(stream_storage) {}
     void start() {
         read();  // Initiate first read
     }
@@ -300,6 +301,107 @@ private:
         return std::stoi(rightPart_newId) > rightPart_oldId;
     }
 
+    bool xaadIdIsLessThan(const std::string& newId, const std::string& oldId) {
+        if (oldId == "+") {
+            return true; // means max, always take till the end of the stream
+        }
+        size_t dashPos_newId = newId.find('-');
+        size_t dashPos_oldId = oldId.find('-');
+        int leftPart_newId = std::stoi(newId.substr(0, dashPos_newId));
+        std::string rightPart_newId = newId.substr(dashPos_newId + 1);
+        int leftPart_oldId = std::stoi(oldId.substr(0, dashPos_oldId)); // don't have * so can convert direct to int
+        int rightPart_oldId = std::stoi(oldId.substr(dashPos_oldId + 1));
+
+        if (leftPart_newId != leftPart_oldId) {
+            return leftPart_newId < leftPart_oldId;
+        }
+        // If left parts are equal, compare right parts
+        // If right part is a wild card then return true
+        if (rightPart_newId == "*") {
+            return false;
+        }
+        return std::stoi(rightPart_newId) < rightPart_oldId;
+    }
+
+    // Helper function to get stream entries that match criteria
+    std::pair<int, std::string> getStreamEntries(
+        const std::string& key,
+        const std::string& start_id,
+        const std::string& end_id) {
+        
+        int entries_count = 0;
+        std::string entries_data = "";
+        
+        auto it_stream = stream_storage_->find(key);
+        if (it_stream == stream_storage_->end()) {
+            return {0, ""};
+        }
+        
+        // Start from front to back
+        auto& vector_of_tuples = it_stream->second;
+        for (const auto& tuple : vector_of_tuples) {
+            std::string id = std::get<0>(tuple);
+            std::vector<std::string> values = std::get<1>(tuple);
+            
+            bool include = false;
+            if (end_id == "&") { // xread
+                include = xaadIdIsGreaterThan(id, start_id);
+            } else { // xrange
+                include = (start_id == id || end_id == id || 
+                            (xaadIdIsGreaterThan(id, start_id) && xaadIdIsLessThan(id, end_id)));
+            }
+            
+            if (include) {
+                std::string values_message = format_resp_array(values, true);
+                entries_data += "*2\r\n$" + std::to_string(id.size()) + "\r\n" + id + "\r\n" + values_message;
+                entries_count++;
+            }
+        }
+        
+        return {entries_count, entries_data};
+    }
+
+    // When use lambda version it captured the for checkentries with form captured values (keys was 0)
+    void checkEntries(const asio::error_code& ec,
+                      std::shared_ptr<asio::steady_timer> timer,
+                      const std::vector<std::string>& keys,
+                      const std::vector<std::string>& last_seen_ids,
+                      int block_duration_ms) {
+        if (ec) {
+            std::cout << "Error or canceled, sending null" << std::endl;
+            manual_write("$-1\r\n");
+            return;
+        }
+
+        // Check for new entries
+        std::string result = "*" + std::to_string(keys.size()) + "\r\n";
+        bool has_new_entries = false;
+        for (size_t i = 0; i < keys.size(); i++) {
+            auto [entries_count, entries_data] = getStreamEntries(keys[i], last_seen_ids[i], "&");
+            result += "*2\r\n$" + std::to_string(keys[i].size()) + "\r\n" + keys[i] + "\r\n*" +
+                      std::to_string(entries_count) + "\r\n" + entries_data;
+            if (entries_count > 0) {
+                has_new_entries = true;
+            }
+        }
+
+        if (has_new_entries) {
+            manual_write(result);
+            return;
+        }
+
+        // Handle timeout or continue polling
+        if (block_duration_ms != 0 && timer->expiry() <= std::chrono::steady_clock::now()) {
+            manual_write("$-1\r\n");
+            return;
+        }
+
+        timer->expires_after(std::chrono::milliseconds(500)); // Poll every 500ms
+        timer->async_wait([this, timer, keys, last_seen_ids, block_duration_ms](const asio::error_code& ec) {
+            checkEntries(ec, timer, keys, last_seen_ids, block_duration_ms);
+        });
+    }
+
     // Processes commands. Commands are sent in an array consisting of only bulk strings
     void processCommand(const std::string data) {
         if (!isDataValidRedisCommand(data)) {
@@ -358,6 +460,44 @@ private:
                 }
             }   
             write(messages, include_size);
+        }
+        else if (split_data[2] == "INCR") 
+        {
+            // INCR data from storage
+            std::string key = split_data[4];
+
+            auto it = string_storage_->find(key);
+            if (it == string_storage_->end()) {
+                (*string_storage_)[key] = std::make_tuple("1", TimePoint::max());
+                write_integer("1");
+            } else {
+                std::string stored_value = std::get<0>(it -> second);
+
+                // Check if its a valid integer first
+                bool is_integer = true;
+                size_t start = 0;
+                for (size_t i = start; i < stored_value.length(); ++i) {
+                    if (!std::isdigit(stored_value[i])) {
+                        manual_write("-ERR value is not an integer or out of range\r\n");
+                        is_integer = false;
+                        break;
+                    }
+                }
+
+                if (is_integer) {
+                    size_t incr_value = std::stoi(stored_value) + 1;
+                    TimePoint expiry_time = std::get<1>(it -> second);
+                    
+                    if (std::chrono::system_clock::now() > expiry_time) {
+                        string_storage_->erase(it);
+                        write_integer("1");
+                    } else {
+                        (*string_storage_)[key] = std::make_tuple(std::to_string(incr_value), expiry_time);
+                        write_integer(std::to_string(incr_value));
+                    }
+                }
+                
+            }
         }
         else if (split_data[2] == "CONFIG") 
         {
@@ -432,8 +572,7 @@ private:
             }
             // Create a timer for the timeout
             auto timer = std::make_shared<asio::steady_timer>(socket_.get_executor());
-            timer->expires_after(std::chrono::milliseconds(timeoutMs));
-        
+            timer->expires_after(std::chrono::milliseconds(timeoutMs));        
             // Store a reference to self to keep the session alive
             auto self = shared_from_this();
             
@@ -474,12 +613,12 @@ private:
                 }
                     
                 // Otherwise, schedule another check after a short delay
-                timer->expires_after(std::chrono::milliseconds(50));
-                timer->async_wait(checkAcks);
+                // timer->expires_after(std::chrono::milliseconds(50)); // This is less likely to be triggered since it starts after waiting for expiry_After
+                // timer->async_wait(checkAcks);
             };
             
             // Start the acknowledgment checking process
-            timer->async_wait(checkAcks);            
+            timer->async_wait(checkAcks);            // starts after waiting for expiry_After
         }
         else if (split_data[2] == "TYPE") {
             // Get type of data from storage
@@ -505,12 +644,18 @@ private:
                 }   
             }
         }
-        else if (split_data[2] == "XADD") {
-            // Store stream data
+        else if (split_data[2] == "XADD" || split_data[2] == "xadd") {
             std::string key = split_data[4];
             std::string id = split_data[6];
             std::string leftPart_Id, rightPart_Id;
-            std::vector<std::string> subVector(split_data.begin() + 7, split_data.end());
+            std::vector<std::string> values;
+            // Start at index 7 (after command, key, ID and their length prefixes)
+            for (size_t i = 7; i < split_data.size(); i += 2) {
+                // Skip the length indicator ($3) and include only the actual value
+                if (i + 1 < split_data.size()) {
+                    values.push_back(split_data[i + 1]);
+                }
+            }
             if (id == "*") {
                 std::string generated_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count());
@@ -533,8 +678,9 @@ private:
                 } else if (rightPart_Id == "*") {
                     id = leftPart_Id + "-" + "0"; // default sequence number is 0
                 }
-                new_entry.push_back(std::make_tuple(id, subVector));
+                new_entry.push_back(std::make_tuple(id, values));
                 (*stream_storage_)[key] = new_entry;
+                std::cout << "added as new entry with key" << key << std::endl;
                 write_bulk_string(id);
             } else {
                 // check if entry is valid
@@ -559,9 +705,124 @@ private:
                         }
                     }
                     auto& vector_of_tuples = it_stream->second;
-                    vector_of_tuples.push_back(std::make_tuple(id, subVector));
+                    vector_of_tuples.push_back(std::make_tuple(id, values));
                     write_bulk_string(id);
                 }
+            }
+        }
+        else if (split_data[2] == "XRANGE" || split_data[2] == "xrange") {
+            std::string key = split_data[4];
+            // get start
+            std::string start_id = split_data[6];
+            size_t dashPos_start_id = start_id.find('-');
+            if (start_id == "-") {
+                start_id = "0-1"; // give the smallest possible id so that it will be the beginning of the stream
+            } else if (dashPos_start_id == std::string::npos) {
+                start_id = start_id + "-0";
+            }
+            // get end
+            std::string end_id = split_data[8];
+            size_t dashPos_end_id = end_id.find('-');
+            if (end_id == "+") {
+                end_id = "+";
+            } else if (dashPos_end_id == std::string::npos) {
+                end_id = end_id + "-0";
+            }
+
+            auto [entries_count, entries_data] = getStreamEntries(key, start_id, end_id);
+            manual_write("*" + std::to_string(entries_count) + "\r\n" + entries_data);
+        }
+        else if (split_data[2] == "XREAD" || split_data[2] == "xread") {
+            // Find the "block" keyword
+            size_t block_index = 0;
+            int block_duration_ms = 0;
+            for (size_t i = 0; i < split_data.size(); i++) {
+                if (split_data[i] == "block") {
+                    block_index = i;
+                    block_duration_ms = std::stoi(split_data[i + 2]);
+                    break;
+                }
+            }
+            // Find the "STREAMS" keyword
+            size_t streams_index = 0;
+            for (size_t i = 3; i < split_data.size(); i++) {
+                if (split_data[i] == "streams") {
+                    streams_index = i;
+                    break;
+                }
+            }
+            
+            if (streams_index == 0) {
+                manual_write("-ERR Syntax error\r\n");
+                return;
+            }
+            
+            // Extract the keys and IDs
+            std::vector<std::string> keys;
+            std::vector<std::string> ids;
+            
+            // Calculate where keys and IDs begin (since we know its half keys half ids)
+            size_t total_items = split_data.size() - streams_index - 1;
+            size_t num_keys = total_items / 2;
+            
+            // Extract keys (first half after "STREAMS")
+            for (size_t i = 1; i < num_keys; i+=2) {
+                keys.push_back(split_data[streams_index + 1 + i]);
+            }
+            
+            // Extract IDs (second half after keys)
+            for (size_t i = 1; i < num_keys; i+=2) {
+                ids.push_back(split_data[streams_index + 1 + num_keys + i]);
+            }
+            if (block_index == 0) {
+                // Non-blocking XREAD: respond immediately with existing entries
+                std::string result = "*" + std::to_string(keys.size()) + "\r\n";
+                for (size_t i = 0; i < keys.size(); i++) {
+                    auto [entries_count, entries_data] = getStreamEntries(keys[i], ids[i], "&");
+                    result += "*2\r\n$" + std::to_string(keys[i].size()) + "\r\n" + keys[i] + "\r\n*" +
+                              std::to_string(entries_count) + "\r\n" + entries_data;
+                }
+                manual_write(result);
+            } else {
+                // Blocking XREAD
+                auto self = shared_from_this();
+                auto timer = std::make_shared<asio::steady_timer>(socket_.get_executor());
+                
+                if (block_duration_ms == 0) {
+                    timer->expires_after(std::chrono::milliseconds(50)); // Initial polling interval for blocking
+                } else {
+                    timer->expires_after(std::chrono::milliseconds(block_duration_ms)); // Total timeout
+                }
+
+                // Track the highest existing ID for each key as the baseline
+                std::vector<std::string> last_seen_ids(keys.size());
+                for (size_t i = 0; i < keys.size(); i++) {
+                    if (ids[i] == "$") { // Not too sure why becauase I thought all blocking is to block till new entries. Currently if lets say we have 3 existing entries 1, 2, 3 and the stream id is 1, the last seen ids will take it as 3 so only checks for 4 and above
+                        // Use the current maximum ID if $ is specified
+                        auto it = stream_storage_->find(keys[i]);
+                        if (it != stream_storage_->end() && !it->second.empty()) {
+                            last_seen_ids[i] = std::get<0>(it->second.back());
+                        } else {
+                            last_seen_ids[i] = "0-0"; // Default minimal ID for empty streams
+                        }
+                    } else {
+                        // Use the provided ID and update if necessary
+                        auto it = stream_storage_->find(keys[i]);
+                        if (it != stream_storage_->end() && !it->second.empty()) {
+                            last_seen_ids[i] = std::get<0>(it->second.back());
+                            if (xaadIdIsGreaterThan(ids[i], last_seen_ids[i])) { 
+                                last_seen_ids[i] = ids[i];
+                            }
+                        } else {
+                            last_seen_ids[i] = ids[i];
+                        }
+                    }
+                }
+
+                // Start with an immediate async check
+                timer->async_wait([this, self, timer, keys, last_seen_ids, block_duration_ms](const asio::error_code& ec) {
+                    checkEntries(ec, timer, keys, last_seen_ids, block_duration_ms);
+                });
             }
         }
         else {
@@ -574,7 +835,19 @@ private:
         commandFromMasterSizes += data.size();
     }
 
-    // TODO: Write in different format simple string, bulk string, array
+    // TODO: Wrap stuff with this function
+    std::string format_resp_array(std::vector<std::string> messages, bool formatContent = false) {
+        std::stringstream msg_stream;
+        msg_stream << "*" << messages.size() << "\r\n";
+        if (formatContent) {
+            for (std::string message: messages) {
+                msg_stream << "$" << message.size() << "\r\n" << message << "\r\n";
+            }
+        }
+
+        return msg_stream.str();
+    }
+
     // Write without any parsing
     void manual_write(std::string message) {
         auto self(shared_from_this());
@@ -593,6 +866,20 @@ private:
         auto self(shared_from_this());
         std::string formatted_message = "+" + message + "\r\n";
         std::cout << "MESSAGE SENT (simple string)..: " << formatted_message << std::endl;
+        asio::async_write(socket_, asio::buffer(formatted_message, formatted_message.size()),
+            [this, self](asio::error_code ec, std::size_t /*length*/) {
+                if (!ec) {
+                    read();  // Continue reading after successful write
+                } else {
+                    std::cerr << "Write error: " << ec.message() << std::endl;
+                }
+            });
+    }
+
+    void write_integer(std::string message) {
+        auto self(shared_from_this());
+        std::string formatted_message = ":" + message + "\r\n";
+        std::cout << "MESSAGE SENT (integer)..: " << formatted_message << std::endl;
         asio::async_write(socket_, asio::buffer(formatted_message, formatted_message.size()),
             [this, self](asio::error_code ec, std::size_t /*length*/) {
                 if (!ec) {
@@ -650,7 +937,7 @@ private:
     tcp::socket socket_;          
     std::array<char, 1024> buffer_;  
     std::shared_ptr<StringStorageType> string_storage_;
-    std::shared_ptr<StreamStorageType> stream_storage_ = std::make_shared<StreamStorageType>();;
+    std::shared_ptr<StreamStorageType> stream_storage_;
     std::string dir_;
     std::string dbfilename_;
     std::string masterdetails_;
@@ -660,6 +947,8 @@ private:
     size_t commandFromMasterSizes = 0;
     size_t propagatedCommandSizes = 0;
     size_t lastAcknowledgedBytes = 0;
+    std::shared_ptr<TimePoint> blocking_time;
+    std::shared_ptr<bool> isBlocked = std::make_shared<bool>(false);
 };
 
 void accept_connections(
@@ -669,16 +958,17 @@ void accept_connections(
         std::string dbfilename,
         std::string masterdetails,
         std::string master_repl_id,
-        unsigned master_repl_offset
+        unsigned master_repl_offset,
+        std::shared_ptr<StreamStorageType> stream_storage
     ) {
     acceptor.async_accept(
-        [&acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, tcp::socket socket) {
+        [&acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage](asio::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset)->start();
+                std::make_shared<Session>(std::move(socket), storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage)->start();
                 std::cout << "Client connected" << std::endl;
                 
             }
-            accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset); // Recursively continues to listen for new connections 
+            accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage); // Recursively continues to listen for new connections 
         });
 }
 
@@ -717,7 +1007,8 @@ void connectToMaster(asio::io_context& io_context,
                      const std::string& dbfilename,
                      const std::string& master_repl_id,
                      unsigned master_repl_offset,
-                     unsigned portnumber) {
+                     unsigned portnumber,
+                     std::shared_ptr<StreamStorageType> stream_storage) {
     auto [masterHost, masterPort] = parseHostPort(masterdetails);
 
     auto master_socket = std::make_shared<tcp::socket>(io_context);
@@ -727,7 +1018,7 @@ void connectToMaster(asio::io_context& io_context,
     asio::async_connect(
         *master_socket,
         endpoints,
-        [master_socket, &io_context, masterdetails, storage, dir, dbfilename, master_repl_id, master_repl_offset, portnumber](asio::error_code ec, tcp::endpoint /*ep*/) {
+        [master_socket, &io_context, masterdetails, storage, dir, dbfilename, master_repl_id, master_repl_offset, portnumber, stream_storage](asio::error_code ec, tcp::endpoint /*ep*/) {
             if (!ec) {
                 std::cout << "Connected to master. Now sending PING..." << std::endl;
                 // FIRST STEP SEND PING
@@ -735,9 +1026,9 @@ void connectToMaster(asio::io_context& io_context,
                 asio::async_write(
                     *master_socket,
                     asio::buffer(ping_cmd),
-                    [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber](asio::error_code ec, std::size_t /*length*/) {
+                    [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber, stream_storage](asio::error_code ec, std::size_t /*length*/) {
                         if (!ec) {
-                            readResponse(master_socket, "after PING", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber]() {
+                            readResponse(master_socket, "after PING", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, portnumber, stream_storage]() {
                                 // SECOND STEP SEND REPLCONF commands
                                 std::string port_str = std::to_string(portnumber);
                                 std::string first_replconf = "*3\r\n"
@@ -748,23 +1039,23 @@ void connectToMaster(asio::io_context& io_context,
                                 asio::async_write(
                                     *master_socket,
                                     asio::buffer(first_replconf),
-                                    [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
+                                    [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage](asio::error_code ec, std::size_t /*length*/) {
                                         if (!ec) {
                                             std::string second_replconf = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
                                             asio::async_write(
                                                 *master_socket,
                                                 asio::buffer(second_replconf),
-                                                [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
+                                                [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage](asio::error_code ec, std::size_t /*length*/) {
                                                     if (!ec) {
-                                                        readResponse(master_socket, "after REPLCONF", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset]() {
+                                                        readResponse(master_socket, "after REPLCONF", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage]() {
                                                             // THIRD STEP SEND PSYNC
                                                             std::string psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
                                                             asio::async_write(
                                                                 *master_socket,
                                                                 asio::buffer(psync),
-                                                                [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset](asio::error_code ec, std::size_t /*length*/) {
+                                                                [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage](asio::error_code ec, std::size_t /*length*/) {
                                                                     if (!ec) {
-                                                                        readResponse(master_socket, "after PSYNC", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset]() {
+                                                                        readResponse(master_socket, "after PSYNC", [master_socket, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage]() {
                                                                             std::cout << "Replication handshake complete. Switching to replica session." << std::endl;
                                                                             // Now, wrap the master_socket in a Session with replica mode enabled.
                                                                             auto replica_session = std::make_shared<Session>(
@@ -774,7 +1065,8 @@ void connectToMaster(asio::io_context& io_context,
                                                                                 dbfilename,
                                                                                 masterdetails,
                                                                                 master_repl_id,
-                                                                                master_repl_offset
+                                                                                master_repl_offset,
+                                                                                stream_storage
                                                                             );
                                                                             replica_session->setReplica(true);
                                                                             replica_session->start();
@@ -956,14 +1248,15 @@ int main(int argc, char* argv[]) {
         tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), portnumber));
         
         auto storage = std::make_shared<StringStorageType>();  // Use tuple storage
+        auto stream_storage = std::make_shared<StreamStorageType>();
         loadDatabase(dir, dbfilename, storage);
 
         // Start accepting connections
-        accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset);
+        accept_connections(acceptor, storage, dir, dbfilename, masterdetails, master_repl_id, master_repl_offset, stream_storage);
         std::cout << "Server listening on port " << portnumber << "..." << std::endl;
 
         if (!masterdetails.empty()) {
-            connectToMaster(io_context, masterdetails, storage, dir, dbfilename, master_repl_id, master_repl_offset, portnumber);
+            connectToMaster(io_context, masterdetails, storage, dir, dbfilename, master_repl_id, master_repl_offset, portnumber, stream_storage);
         }
         
         // Run the I/O service - blocks until all work is done
